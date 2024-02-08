@@ -1,10 +1,10 @@
 use crate::fragment::{Fragment, Match, Stmts};
 use crate::internals::ast::{Container, Data, Field, Style, Variant};
-use crate::internals::attr::{self, VariantMix, VariantName, IntRepr};
+use crate::internals::attr::{self, IntRepr, VariantMix, VariantName};
 use crate::internals::{replace_receiver, Ctxt, Derive};
 use crate::{bound, dummy, pretend, this};
 use proc_macro2::{Span, TokenStream};
-use quote::{quote, quote_spanned, ToTokens};
+use quote::{quote, quote_spanned};
 use syn::spanned::Spanned;
 use syn::{parse_quote, Ident, Index, Member};
 
@@ -625,7 +625,7 @@ fn serialize_internally_tagged_variant(
 
     match effective_style(variant) {
         Style::Unit => {
-            let variant_name = variant_name.to_token_stream();
+            let variant_name = variant_name.to_literal(mix);
             quote_block! {
                 let mut __struct = _serde::Serializer::serialize_struct(
                     __serializer, #type_name, 1)?;
@@ -690,7 +690,7 @@ fn serialize_adjacently_tagged_variant(
                 }
             }
         }
-        _ => variant_name.to_token_stream(),
+        _ => variant_name.to_literal(mix),
     };
 
     let inner = Stmts(if let Some(path) = variant.attrs.serialize_with() {
@@ -832,7 +832,13 @@ fn serialize_untagged_variant(
         Style::Tuple => serialize_tuple_variant(TupleVariant::Untagged, params, &variant.fields),
         Style::Struct => {
             let type_name = cattrs.name().serialize_name();
-            serialize_struct_variant(VariantMix::Any, StructVariant::Untagged, params, &variant.fields, type_name)
+            serialize_struct_variant(
+                VariantMix::Any,
+                StructVariant::Untagged,
+                params,
+                &variant.fields,
+                type_name,
+            )
         }
     }
 }
@@ -1399,10 +1405,10 @@ fn serialize_variant_name(mix: VariantMix, name: &VariantName) -> TokenStream {
     match name {
         VariantName::String(s) => quote!(_serde::__private::ser::VariantName::String(#s)),
         VariantName::Integer(i) => {
-            let num = quote!(#name);
+            let num = name.to_literal(mix);
             let repr = match mix {
                 VariantMix::OnlyIntegers(repr) => repr,
-                _ => i.repr.unwrap(), // TODO!!! ERROR!!!
+                _ => i.repr.unwrap_or(IntRepr::I64),
             };
             let variant = match repr {
                 IntRepr::U8 => quote!(_serde::__private::ser::Integer::U8),
@@ -1415,7 +1421,7 @@ fn serialize_variant_name(mix: VariantMix, name: &VariantName) -> TokenStream {
                 IntRepr::I64 => quote!(_serde::__private::ser::Integer::I64),
             };
             quote!(_serde::__private::ser::VariantName::Integer(#variant(#num)))
-        },
+        }
         VariantName::Boolean(b) => quote!(_serde::__private::ser::VariantName::Boolean(#b)),
     }
 }
