@@ -2868,7 +2868,7 @@ fn test_non_string_renames() {
                 len: 1,
             },
             Token::Str("op"),
-            Token::I64(1),
+            Token::U64(1),
             Token::StructEnd,
         ],
     );
@@ -2928,7 +2928,7 @@ fn test_non_string_renames() {
                 len: 2,
             },
             Token::Str("op"),
-            Token::I64(1),
+            Token::U64(1),
             Token::Str("d"),
             Token::Struct { name: "1", len: 1 },
             Token::Str("a"),

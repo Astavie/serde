@@ -9,6 +9,7 @@ use syn::meta::ParseNestedMeta;
 use syn::parse::ParseStream;
 use syn::punctuated::Punctuated;
 use syn::{parse_quote, token, Ident, Lifetime, Token};
+use quote::quote;
 
 // This module handles parsing of `#[serde(...)]` attributes. The entrypoints
 // are `attr::Container::from_ast`, `attr::Variant::from_ast`, and
@@ -129,10 +130,54 @@ impl<'c, T> VecAttr<'c, T> {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum IntRepr {
+    I8,
+    U8,
+
+    I16,
+    U16,
+
+    I32,
+    U32,
+
+    I64,
+    U64,
+}
+
+impl IntRepr {
+    fn from_integer(i: Integer) -> Option<IntRepr> {
+        if let Some(repr) = i.repr {
+            Some(repr)
+        } else {
+            match i.negative {
+                false if i.magnitude <= u64::from( u8::MAX) => Some(Self::U8),
+                false if i.magnitude <= u64::from(u16::MAX) => Some(Self::U16),
+                false if i.magnitude <= u64::from(u32::MAX) => Some(Self::U32),
+                false if i.magnitude <= u64::from(u64::MAX) => Some(Self::U64),
+
+                true if i.magnitude <= u64::from( u8::MAX) / 2 + 1 => Some(Self::I8),
+                true if i.magnitude <= u64::from(u16::MAX) / 2 + 1 => Some(Self::I16),
+                true if i.magnitude <= u64::from(u32::MAX) / 2 + 1 => Some(Self::I32),
+                true if i.magnitude <= u64::from(u64::MAX) / 2 + 1 => Some(Self::I64),
+
+                _ => None,
+            }
+        }
+    }
+}
+
+#[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug)]
+pub struct Integer {
+    pub negative: bool,
+    pub magnitude: u64,
+    pub repr: Option<IntRepr>,
+}
+
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Debug)]
 pub enum VariantName {
     String(String),
-    Integer(i64),
+    Integer(Integer),
     Boolean(bool),
 }
 
@@ -140,17 +185,24 @@ impl VariantName {
     pub fn to_variant_string(&self) -> String {
         match self {
             VariantName::String(s) => s.clone(),
-            VariantName::Integer(i) => i.to_string(),
+            VariantName::Integer(i) => {
+                if i.negative {
+                    format!("-{}", i.magnitude)
+                } else {
+                    format!("{}", i.magnitude)
+                }
+            },
             VariantName::Boolean(b) => b.to_string(),
         }
     }
 }
 
 /// An enum representing the distribution of different variant names
-#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum VariantMix {
     OnlyStrings,
-    OnlyIntegers,
+    UnknownIntegers,
+    OnlyIntegers(IntRepr),
     OnlyBooleans,
     Any,
 }
@@ -158,22 +210,49 @@ pub enum VariantMix {
 impl VariantMix {
     fn from_single(variant: &VariantName) -> Self {
         match variant {
-            VariantName::String(_) => Self::OnlyStrings,
-            VariantName::Integer(_) => Self::OnlyIntegers,
-            VariantName::Boolean(_) => Self::OnlyBooleans,
+            &VariantName::String(_) => Self::OnlyStrings,
+            &VariantName::Integer(i) => IntRepr::from_integer(i).map(VariantMix::OnlyIntegers).unwrap_or(VariantMix::UnknownIntegers),
+            &VariantName::Boolean(_) => Self::OnlyBooleans,
         }
     }
     pub fn from_ser(variants: &[ast::Variant]) -> Self {
         let mut iter = variants.iter().map(|v| v.attrs.name.serialize_name());
         match iter.next() {
             Some(first) => {
-                let mix = Self::from_single(first);
+                let mut mix = Self::from_single(first);
                 for rest in iter {
-                    if Self::from_single(rest) != mix {
-                        return Self::Any;
+                    if mix == VariantMix::Any {
+                        return mix;
                     }
+                    mix = match (Self::from_single(rest), mix) {
+                        (VariantMix::OnlyStrings, VariantMix::OnlyStrings) => VariantMix::OnlyStrings,
+                        (VariantMix::OnlyBooleans, VariantMix::OnlyBooleans) => VariantMix::OnlyBooleans,
+                        (VariantMix::OnlyIntegers(a), VariantMix::OnlyIntegers(b)) if a == b => VariantMix::OnlyIntegers(a),
+                        (VariantMix::OnlyIntegers(a), VariantMix::UnknownIntegers) => VariantMix::OnlyIntegers(a),
+                        (VariantMix::UnknownIntegers, VariantMix::OnlyIntegers(b)) => VariantMix::OnlyIntegers(b),
+                        _ => VariantMix::Any,
+                    };
                 }
-                mix
+                if mix == VariantMix::UnknownIntegers {
+                    let negative = variants.iter().map(|v| v.attrs.name.serialize_name()).any(|v| match v {
+                        VariantName::Integer(i) => i.negative,
+                        _ => false,
+                    });
+                    let max = variants.iter().map(|v| v.attrs.name.serialize_name()).filter_map(|v| match v {
+                        VariantName::Integer(i) => Some(i.magnitude),
+                        _ => None,
+                    }).max().unwrap();
+                    match IntRepr::from_integer(Integer {
+                        negative,
+                        magnitude: max,
+                        repr: None,
+                    }) {
+                        Some(repr) => VariantMix::OnlyIntegers(repr),
+                        None => VariantMix::UnknownIntegers,
+                    }
+                } else {
+                    mix
+                }
             }
 
             // string variants are the base case as they were the original case
@@ -184,13 +263,40 @@ impl VariantMix {
         let mut iter = variants.iter().map(|v| v.attrs.name.deserialize_name());
         match iter.next() {
             Some(first) => {
-                let mix = Self::from_single(first);
+                let mut mix = Self::from_single(first);
                 for rest in iter {
-                    if Self::from_single(rest) != mix {
-                        return Self::Any;
+                    if mix == VariantMix::Any {
+                        return mix;
                     }
+                    mix = match (Self::from_single(rest), mix) {
+                        (VariantMix::OnlyStrings, VariantMix::OnlyStrings) => VariantMix::OnlyStrings,
+                        (VariantMix::OnlyBooleans, VariantMix::OnlyBooleans) => VariantMix::OnlyBooleans,
+                        (VariantMix::OnlyIntegers(a), VariantMix::OnlyIntegers(b)) if a == b => VariantMix::OnlyIntegers(a),
+                        (VariantMix::OnlyIntegers(a), VariantMix::UnknownIntegers) => VariantMix::OnlyIntegers(a),
+                        (VariantMix::UnknownIntegers, VariantMix::OnlyIntegers(b)) => VariantMix::OnlyIntegers(b),
+                        _ => VariantMix::Any,
+                    };
                 }
-                mix
+                if mix == VariantMix::UnknownIntegers {
+                    let negative = variants.iter().map(|v| v.attrs.name.deserialize_name()).any(|v| match v {
+                        VariantName::Integer(i) => i.negative,
+                        _ => false,
+                    });
+                    let max = variants.iter().map(|v| v.attrs.name.deserialize_name()).filter_map(|v| match v {
+                        VariantName::Integer(i) => Some(i.magnitude),
+                        _ => None,
+                    }).max().unwrap();
+                    match IntRepr::from_integer(Integer {
+                        negative,
+                        magnitude: max,
+                        repr: None,
+                    }) {
+                        Some(repr) => VariantMix::OnlyIntegers(repr),
+                        None => VariantMix::UnknownIntegers,
+                    }
+                } else {
+                    mix
+                }
             }
 
             // string variants are the base case as they were the original case
@@ -201,7 +307,7 @@ impl VariantMix {
 
 pub trait AsVariant {
     fn as_string(&self) -> Option<&str>;
-    fn as_int(&self) -> Option<i64>;
+    fn as_int(&self) -> Option<Integer>;
     fn as_bool(&self) -> Option<bool>;
 }
 
@@ -213,7 +319,7 @@ impl AsVariant for VariantName {
         }
     }
 
-    fn as_int(&self) -> Option<i64> {
+    fn as_int(&self) -> Option<Integer> {
         match self {
             VariantName::Integer(i) => Some(*i),
             _ => None,
@@ -233,7 +339,7 @@ impl AsVariant for String {
         Some(self)
     }
 
-    fn as_int(&self) -> Option<i64> {
+    fn as_int(&self) -> Option<Integer> {
         None
     }
 
@@ -246,7 +352,19 @@ impl ToTokens for VariantName {
     fn to_tokens(&self, tokens: &mut TokenStream) {
         match self {
             VariantName::String(name) => name.to_tokens(tokens),
-            VariantName::Integer(name) => name.to_tokens(tokens),
+            VariantName::Integer(name) => {
+                let magnitude = name.magnitude;
+                let stream = if name.negative {
+                    quote! {
+                        -#magnitude
+                    }
+                } else {
+                    quote! {
+                        #magnitude
+                    }
+                };
+                tokens.extend(stream);
+            },
             VariantName::Boolean(name) => name.to_tokens(tokens),
         }
     }
@@ -1675,12 +1793,16 @@ fn get_variant_name2(
         let parse_result = lit.base10_parse();
 
         if let Ok(i) = parse_result {
-            Ok(Some(VariantName::Integer(i)))
+            Ok(Some(VariantName::Integer(Integer {
+                negative: false,
+                magnitude: i,
+                repr: None,
+            })))
         } else {
             cx.error_spanned_by(
                 lit,
                 format!(
-                    "serde {} attribute has an integer value that cannot be represented as an i64",
+                    "serde {} attribute has an integer value that cannot be represented as a u64",
                     attr_name
                 ),
             );
